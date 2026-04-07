@@ -1,0 +1,7 @@
+yfinance
+alpaca-py
+pandas
+numpy
+python-dotenv
+vectorbt
+schedule
