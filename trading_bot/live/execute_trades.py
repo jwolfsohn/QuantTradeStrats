@@ -1,6 +1,7 @@
 import os
 import sys
 import yfinance as yf
+import logging
 
 # Ensure we can import config
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,11 +19,20 @@ def rebalance_to_target(target_allocation: dict):
     Master portfolio routing. Completely robust handling for Longs, Shorts, 
     Reductions, and Covers based on the exact target_allocation weights.
     """
-    print(f"Executing master portfolio rebalance: {target_allocation}")
+    logging.info(f"Executing master portfolio rebalance: {target_allocation}")
     
+    # 1. Cancel existing open orders (like stale limit/stop orders) to unlock buying power and prevent wash-trade rejects
+    try:
+        client.cancel_orders()
+        logging.info("Cancelled any pending open orders.")
+        import time
+        time.sleep(1) # Brief pause for Alpaca backend to reconcile collateral
+    except Exception as e:
+        logging.error(f"Could not cancel open orders: {e}")
+
     account = client.get_account()
     equity = float(account.equity)
-    print(f"Current Account Equity: ${equity:,.2f}")
+    logging.info(f"Current Account Equity: ${equity:,.2f}")
 
     # Fetch current positions
     positions = client.get_all_positions()
@@ -44,6 +54,9 @@ def rebalance_to_target(target_allocation: dict):
     for symbol in all_managed_symbols:
         # Prevent attempting to touch non-strategy holdings if the user holds personal stocks
         # Add new symbols to this whitelist as needed
+        if symbol == "OVERNIGHT_SPY":
+            logging.error("OVERNIGHT_SPY reached rebalance_to_target — it must be converted to SPY in main_bot.py first. Skipping.")
+            continue
         if symbol not in ["SPY", "QQQ", "TLT", "BIL", "EWA", "EWC", "SVXY", "TQQQ", "SQQQ"]:
             continue
             
@@ -62,8 +75,8 @@ def rebalance_to_target(target_allocation: dict):
                 continue
 
         # Calculate exact number of shares we *want* to hold (can be negative for shorts)
-        target_shares = int(target_dollar_value / price)
-        curr_shares = int(current_shares.get(symbol, 0))
+        target_shares = round(target_dollar_value / price)
+        curr_shares = round(current_shares.get(symbol, 0))
         
         delta_shares = target_shares - curr_shares
 
@@ -83,7 +96,7 @@ def rebalance_to_target(target_allocation: dict):
                     side=close_side,
                     time_in_force=TimeInForce.DAY
                 ))
-                print(f"Action: {close_side.name} {close_qty:,.0f} shares of {symbol} to CLOSE existing position")
+                logging.info(f"Action: {close_side.name} {close_qty:,.0f} shares of {symbol} to CLOSE existing position")
                 
                 open_qty = abs(target_shares)
                 open_side = OrderSide.SELL if target_shares < 0 else OrderSide.BUY
@@ -93,7 +106,7 @@ def rebalance_to_target(target_allocation: dict):
                     side=open_side,
                     time_in_force=TimeInForce.DAY
                 ))
-                print(f"Action: {open_side.name} {open_qty:,.0f} shares of {symbol} to OPEN new target position")
+                logging.info(f"Action: {open_side.name} {open_qty:,.0f} shares of {symbol} to OPEN new target position")
                 
             else:
                 # Same sign or starting/ending at zero
@@ -104,7 +117,7 @@ def rebalance_to_target(target_allocation: dict):
                         side=OrderSide.BUY,
                         time_in_force=TimeInForce.DAY
                     ))
-                    print(f"Action: BUY {delta_shares:,.0f} shares of {symbol} (Target: {target_shares}, Current: {curr_shares})")
+                    logging.info(f"Action: BUY {delta_shares:,.0f} shares of {symbol} (Target: {target_shares}, Current: {curr_shares})")
                 elif delta_shares < 0:
                     sell_amount = abs(delta_shares)
                     orders_to_execute.append(MarketOrderRequest(
@@ -113,17 +126,32 @@ def rebalance_to_target(target_allocation: dict):
                         side=OrderSide.SELL,
                         time_in_force=TimeInForce.DAY
                     ))
-                    print(f"Action: SELL (or SHORT) {sell_amount:,.0f} shares of {symbol} (Target: {target_shares}, Current: {curr_shares})")
+                    logging.info(f"Action: SELL (or SHORT) {sell_amount:,.0f} shares of {symbol} (Target: {target_shares}, Current: {curr_shares})")
 
-    # Execute all orders
-    for order in orders_to_execute:
+    # Execute SELL orders first to free up buying power
+    buys = [o for o in orders_to_execute if o.side == OrderSide.BUY]
+    sells = [o for o in orders_to_execute if o.side == OrderSide.SELL]
+
+    for order in sells:
         try:
             client.submit_order(order)
-            print(f"Submitted order for {order.symbol}")
+            logging.info(f"Submitted SELL order for {order.symbol}")
         except Exception as e:
-            print(f"Order failed for {order.symbol}: {e}")
+            logging.error(f"SELL Order failed for {order.symbol}: {e}")
 
-    print("Rebalancing complete.")
+    # Wait for SELLs to clear Alpaca's margin backend
+    if len(sells) > 0:
+        import time
+        time.sleep(2)
+
+    for order in buys:
+        try:
+            client.submit_order(order)
+            logging.info(f"Submitted BUY order for {order.symbol}")
+        except Exception as e:
+            logging.error(f"BUY Order failed for {order.symbol}: {e}")
+
+    logging.info("Rebalancing complete.")
 
 def filter_yfinance_price(symbol):
     ticker = yf.Ticker(symbol)

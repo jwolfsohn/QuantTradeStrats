@@ -11,10 +11,12 @@ def main():
     print("Fetching massive historical data (2007-2026) for comprehensive backtest...")
     import yfinance as yf
     tickers = ["SPY", "QQQ", "TLT", "BIL", "EWA", "EWC", "^VIX", "SVXY", "TQQQ", "SQQQ"]
-    data = yf.download(tickers, start="2007-01-01", interval="1d", progress=False)['Close']
+    data = yf.download(tickers, start="2007-01-01", interval="1d", progress=False)
+    data_close = data['Close']
+    data_open = data['Open']
     
     # Process market matrix mapping
-    df = data.dropna(subset=['SPY']).copy()
+    df = data_close.dropna(subset=['SPY']).copy()
     
     # SVXY was created in 2011. Forward-fill existing series. Leave unlisted periods as NaN.
     df.ffill(inplace=True)
@@ -36,10 +38,16 @@ def main():
         # 1. PnL of yesterday's target execution onto today's market curve
         pnl_pct = 0.0
         for ticker, weight in current_allocation.items():
-            if weight != 0 and pd.notna(df[ticker].iloc[i-1]) and df[ticker].iloc[i-1] != 0:
-                ret = daily_returns_cache[ticker].iloc[i]
-                if pd.notna(ret) and not np.isinf(ret):
-                    pnl_pct += weight * ret
+            if weight != 0 and ticker != "OVERNIGHT_SPY":
+                if pd.notna(df[ticker].iloc[i-1]) and df[ticker].iloc[i-1] != 0:
+                    ret = daily_returns_cache[ticker].iloc[i]
+                    if pd.notna(ret) and not np.isinf(ret):
+                        pnl_pct += weight * ret
+            elif weight != 0 and ticker == "OVERNIGHT_SPY":
+                if pd.notna(df['SPY'].iloc[i-1]) and df['SPY'].iloc[i-1] != 0:
+                    ret = (data_open['SPY'].iloc[i] / df['SPY'].iloc[i-1]) - 1
+                    if pd.notna(ret) and not np.isinf(ret):
+                        pnl_pct += weight * ret
                 
         new_value = portfolio_value[-1] * (1 + pnl_pct)
         portfolio_value.append(new_value)
@@ -53,7 +61,11 @@ def main():
         
         # Calculate algorithmic weight directives
         macro_targets = get_daily_macro_allocation(spy_df, vix_df, qqq_df)
-        statarb_targets = get_hourly_statarb_allocation(pair_df) # Safe constraint check on daily sequence
+        # NOTE: get_hourly_statarb_allocation is designed for hourly data (live uses interval="1h").
+        # Here it runs on daily closes so the 20-bar rolling Z-score spans 20 days, not 20 hours.
+        # This approximates position-level exposure but does NOT reflect intraday signal quality.
+        # For accurate StatArb backtesting, a separate hourly simulation is required.
+        statarb_targets = get_hourly_statarb_allocation(pair_df)
         
         combined_target = {}
         combined_target.update(macro_targets)
